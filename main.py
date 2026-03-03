@@ -3,37 +3,21 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import httpx
 
 app = FastAPI(title="SafeLock Telemetry")
 
 API_SECRET = os.environ.get("API_SECRET", "openlock2026")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS devices (
-            device_id TEXT PRIMARY KEY,
-            pihole_active BOOLEAN,
-            tailscale_ip TEXT,
-            version TEXT,
-            last_seen TIMESTAMP,
-            status TEXT
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-@app.on_event("startup")
-def startup():
-    init_db()
+def sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+    }
 
 class Heartbeat(BaseModel):
     device_id: str
@@ -45,62 +29,54 @@ class Heartbeat(BaseModel):
 def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
     if x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO devices (device_id, pihole_active, tailscale_ip, version, last_seen, status)
-        VALUES (%s, %s, %s, %s, %s, 'online')
-        ON CONFLICT (device_id) DO UPDATE SET
-            pihole_active = EXCLUDED.pihole_active,
-            tailscale_ip = EXCLUDED.tailscale_ip,
-            version = EXCLUDED.version,
-            last_seen = EXCLUDED.last_seen,
-            status = 'online'
-    """, (data.device_id, data.pihole_active, data.tailscale_ip, data.version, datetime.utcnow()))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"ok": True}
+    payload = {
+        "device_id": data.device_id,
+        "pihole_active": data.pihole_active,
+        "tailscale_ip": data.tailscale_ip,
+        "version": data.version,
+        "last_seen": datetime.utcnow().isoformat(),
+        "status": "online"
+    }
+    r = httpx.post(
+        f"{SUPABASE_URL}/rest/v1/devices",
+        headers=sb_headers(),
+        json=payload
+    )
+    return {"ok": r.status_code in [200, 201]}
 
 @app.get("/devices")
 def get_devices(x_api_secret: str = Header(None)):
     if x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM devices ORDER BY last_seen DESC")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/devices?select=*&order=last_seen.desc",
+        headers=sb_headers()
+    )
+    rows = r.json()
     now = datetime.utcnow()
-    result = []
     online = pihole_active = 0
     for d in rows:
-        d = dict(d)
-        last = d["last_seen"]
+        last = datetime.fromisoformat(d["last_seen"])
         is_online = (now - last) < timedelta(minutes=15)
         d["status"] = "online" if is_online else "offline"
-        d["last_seen"] = last.isoformat()
         if is_online: online += 1
         if is_online and d["pihole_active"]: pihole_active += 1
-        result.append(d)
-    return {"total": len(result), "online": online, "offline": len(result) - online, "pihole_active": pihole_active, "devices": result}
+    return {"total": len(rows), "online": online, "offline": len(rows) - online, "pihole_active": pihole_active, "devices": rows}
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(x_api_secret: str = None):
     if x_api_secret != API_SECRET:
         return HTMLResponse("<h1>401 Unauthorized</h1>", status_code=401)
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM devices ORDER BY last_seen DESC")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/devices?select=*&order=last_seen.desc",
+        headers=sb_headers()
+    )
+    rows = r.json()
     now = datetime.utcnow()
     rows_html = ""
     online = offline = pihole_on = 0
     for d in rows:
-        last = d["last_seen"]
+        last = datetime.fromisoformat(d["last_seen"])
         is_online = (now - last) < timedelta(minutes=15)
         status_color = "#22c55e" if is_online else "#ef4444"
         status_label = "Online" if is_online else "Offline"
@@ -149,12 +125,6 @@ def dashboard(x_api_secret: str = None):
   {rows_html if rows_html else '<tr><td colspan="5" style="text-align:center;color:#475569;padding:32px">Sin dispositivos registrados</td></tr>'}
 </table>
 </body></html>"""
-    return HTMLResponse(html)
-
-@app.get("/")
-def root():
-    return {"service": "SafeLock Telemetry", "version": "1.0.0"}
-
     return HTMLResponse(html)
 
 @app.get("/")
