@@ -25,7 +25,6 @@ def sb_headers():
 
 # --- Seguridad para el Dashboard Web ---
 def verificar_acceso_dashboard(credentials: HTTPBasicCredentials = Depends(security)):
-    # Usuario por defecto: admin / Contraseña: tu API_SECRET
     usuario_correcto = secrets.compare_digest(credentials.username, "admin")
     clave_correcta = secrets.compare_digest(credentials.password, API_SECRET)
     if not (usuario_correcto and clave_correcta):
@@ -47,7 +46,6 @@ async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
     if x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     
-    # Manejo correcto de zona horaria (UTC)
     payload = {
         "device_id": data.device_id,
         "pihole_active": data.pihole_active,
@@ -57,10 +55,8 @@ async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
         "status": "online"
     }
     
-    # httpx Async para no bloquear el Event Loop con múltiples SafeLocks enviando datos
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            # on_conflict evita que se dupliquen filas, hace un verdadero UPSERT
             f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
             headers=sb_headers(),
             json=payload
@@ -77,34 +73,69 @@ async def get_devices(x_api_secret: str = Header(None)):
             f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version&order=last_seen.desc&limit=500",
             headers=sb_headers()
         )
+        
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Error de Supabase: {r.text}")
+
     rows = r.json()
     now = datetime.now(timezone.utc)
     online = pihole_active = 0
+    valid_rows = []
     
     for d in rows:
-        last = datetime.fromisoformat(d["last_seen"].replace("Z", "+00:00"))
-        is_online = (now - last) < timedelta(minutes=15)
-        d["status"] = "online" if is_online else "offline"
-        if is_online: online += 1
-        if is_online and d["pihole_active"]: pihole_active += 1
+        last_seen_str = d.get("last_seen")
+        if not last_seen_str:
+            continue
+            
+        try:
+            last = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
+            # Corrección del error offset-naive vs offset-aware
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+                
+            is_online = (now - last) < timedelta(minutes=15)
+            d["status"] = "online" if is_online else "offline"
+            if is_online: online += 1
+            if is_online and d.get("pihole_active"): pihole_active += 1
+            valid_rows.append(d)
+        except ValueError:
+            continue
         
-    return {"total": len(rows), "online": online, "offline": len(rows) - online, "pihole_active": pihole_active, "devices": rows}
+    return {"total": len(valid_rows), "online": online, "offline": len(valid_rows) - online, "pihole_active": pihole_active, "devices": valid_rows}
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(username: str = Depends(verificar_acceso_dashboard)):
     async with httpx.AsyncClient() as client:
-        # Paginación estricta (limit=500) y solo columnas necesarias para ahorrar RAM
         r = await client.get(
             f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version&order=last_seen.desc&limit=500",
             headers=sb_headers()
         )
+        
+    if r.status_code != 200:
+        return HTMLResponse(f"<h1>Error conectando a Supabase</h1><p>Status: {r.status_code}</p><p>Detalle: {r.text}</p>", status_code=500)
+
     rows = r.json()
+    
+    if isinstance(rows, dict):
+        return HTMLResponse(f"<h1>Error de Formato</h1><p>Supabase devolvió: {rows}</p>", status_code=500)
+
     now = datetime.now(timezone.utc)
     rows_html = ""
     online = offline = pihole_on = 0
     
     for d in rows:
-        last = datetime.fromisoformat(d["last_seen"].replace("Z", "+00:00"))
+        last_seen_str = d.get("last_seen")
+        if not last_seen_str:
+            continue
+            
+        try:
+            last = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
+            # Corrección del error offset-naive vs offset-aware
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+            
         is_online = (now - last) < timedelta(minutes=15)
         
         status_class = "bg-green" if is_online else "bg-red"
@@ -125,14 +156,14 @@ async def dashboard(username: str = Depends(verificar_acceso_dashboard)):
         
         rows_html += f"""
         <tr>
-            <td style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#FFFFFF">{d['device_id']}</td>
+            <td style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#FFFFFF">{d.get('device_id', 'Desconocido')}</td>
             <td><span class="badge {status_class}">{status_label}</span></td>
             <td><span class="badge {pihole_class}">{pihole_label}</span></td>
             <td style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#9CA3AF">{tailscale_disp}</td>
             <td style="color:#9CA3AF;font-size:12px">{time_str}</td>
         </tr>"""
         
-    total = len(rows)
+    total = online + offline
     
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>OpenLock Telemetry</title>
@@ -166,7 +197,6 @@ async def dashboard(username: str = Depends(verificar_acceso_dashboard)):
   .bg-red {{ background: rgba(239, 68, 68, 0.15); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3); }}
 </style>
 <script>
-  // Filtro de búsqueda en tiempo real
   function filterTable() {{
     let input = document.getElementById("searchBox");
     let filter = input.value.toUpperCase();
@@ -187,7 +217,6 @@ async def dashboard(username: str = Depends(verificar_acceso_dashboard)):
       }}
     }}
   }}
-  // Refrescar página cada 60s si no se está escribiendo
   setTimeout(() => {{ if(!document.getElementById('searchBox').value) window.location.reload(); }}, 60000);
 </script>
 </head><body>
