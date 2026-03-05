@@ -1,15 +1,19 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import httpx
+import secrets
 
-app = FastAPI(title="SafeLock Telemetry")
+app = FastAPI(title="SafeLock Telemetry SOC")
 
 API_SECRET = os.environ.get("API_SECRET", "openlock2026")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+security = HTTPBasic()
 
 def sb_headers():
     return {
@@ -19,6 +23,19 @@ def sb_headers():
         "Prefer": "resolution=merge-duplicates"
     }
 
+# --- Seguridad para el Dashboard Web ---
+def verificar_acceso_dashboard(credentials: HTTPBasicCredentials = Depends(security)):
+    # Usuario por defecto: admin / Contraseña: tu API_SECRET
+    usuario_correcto = secrets.compare_digest(credentials.username, "admin")
+    clave_correcta = secrets.compare_digest(credentials.password, API_SECRET)
+    if not (usuario_correcto and clave_correcta):
+        raise HTTPException(
+            status_code=401,
+            detail="Acceso denegado a la Telemetría de OpenLock",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
 class Heartbeat(BaseModel):
     device_id: str
     pihole_active: bool
@@ -26,107 +43,175 @@ class Heartbeat(BaseModel):
     version: str = "1.0"
 
 @app.post("/heartbeat")
-def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
+async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
     if x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    # Manejo correcto de zona horaria (UTC)
     payload = {
         "device_id": data.device_id,
         "pihole_active": data.pihole_active,
         "tailscale_ip": data.tailscale_ip,
         "version": data.version,
-        "last_seen": datetime.utcnow().isoformat(),
+        "last_seen": datetime.now(timezone.utc).isoformat(),
         "status": "online"
     }
-    r = httpx.post(
-        f"{SUPABASE_URL}/rest/v1/devices",
-        headers=sb_headers(),
-        json=payload
-    )
-    return {"ok": r.status_code in [200, 201]}
+    
+    # httpx Async para no bloquear el Event Loop con múltiples SafeLocks enviando datos
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            # on_conflict evita que se dupliquen filas, hace un verdadero UPSERT
+            f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
+            headers=sb_headers(),
+            json=payload
+        )
+    return {"ok": r.status_code in [200, 201, 204]}
 
 @app.get("/devices")
-def get_devices(x_api_secret: str = Header(None)):
+async def get_devices(x_api_secret: str = Header(None)):
     if x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    r = httpx.get(
-        f"{SUPABASE_URL}/rest/v1/devices?select=*&order=last_seen.desc",
-        headers=sb_headers()
-    )
+        
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version&order=last_seen.desc&limit=500",
+            headers=sb_headers()
+        )
     rows = r.json()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     online = pihole_active = 0
+    
     for d in rows:
-        last = datetime.fromisoformat(d["last_seen"])
+        last = datetime.fromisoformat(d["last_seen"].replace("Z", "+00:00"))
         is_online = (now - last) < timedelta(minutes=15)
         d["status"] = "online" if is_online else "offline"
         if is_online: online += 1
         if is_online and d["pihole_active"]: pihole_active += 1
+        
     return {"total": len(rows), "online": online, "offline": len(rows) - online, "pihole_active": pihole_active, "devices": rows}
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(x_api_secret: str = None):
-    if x_api_secret != API_SECRET:
-        return HTMLResponse("<h1>401 Unauthorized</h1>", status_code=401)
-    r = httpx.get(
-        f"{SUPABASE_URL}/rest/v1/devices?select=*&order=last_seen.desc",
-        headers=sb_headers()
-    )
+async def dashboard(username: str = Depends(verificar_acceso_dashboard)):
+    async with httpx.AsyncClient() as client:
+        # Paginación estricta (limit=500) y solo columnas necesarias para ahorrar RAM
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version&order=last_seen.desc&limit=500",
+            headers=sb_headers()
+        )
     rows = r.json()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     rows_html = ""
     online = offline = pihole_on = 0
+    
     for d in rows:
-        last = datetime.fromisoformat(d["last_seen"])
+        last = datetime.fromisoformat(d["last_seen"].replace("Z", "+00:00"))
         is_online = (now - last) < timedelta(minutes=15)
-        status_color = "#22c55e" if is_online else "#ef4444"
-        status_label = "Online" if is_online else "Offline"
-        pihole_color = "#22c55e" if d["pihole_active"] else "#ef4444"
-        pihole_label = "Activo" if d["pihole_active"] else "Inactivo"
+        
+        status_class = "bg-green" if is_online else "bg-red"
+        status_label = "ONLINE" if is_online else "OFFLINE"
+        pihole_class = "bg-green" if d.get("pihole_active") else "bg-red"
+        pihole_label = "PREMIUM" if d.get("pihole_active") else "SUSPENDIDO"
+        
+        tailscale = d.get('tailscale_ip')
+        tailscale_disp = tailscale if tailscale else "Sin configurar"
+        
         if is_online: online += 1
         else: offline += 1
-        if is_online and d["pihole_active"]: pihole_on += 1
+        if is_online and d.get("pihole_active"): pihole_on += 1
+        
         ago = now - last
         mins = int(ago.total_seconds() / 60)
         time_str = f"hace {mins}m" if mins < 60 else f"hace {mins//60}h"
+        
         rows_html += f"""
         <tr>
-            <td style="font-family:monospace;font-size:13px">{d['device_id']}</td>
-            <td><span style="color:{status_color};font-weight:bold">{status_label}</span></td>
-            <td><span style="color:{pihole_color};font-weight:bold">{pihole_label}</span></td>
-            <td style="font-family:monospace;font-size:12px;color:#64748b">{d.get('tailscale_ip','—')}</td>
-            <td style="color:#64748b;font-size:12px">{time_str}</td>
+            <td style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#FFFFFF">{d['device_id']}</td>
+            <td><span class="badge {status_class}">{status_label}</span></td>
+            <td><span class="badge {pihole_class}">{pihole_label}</span></td>
+            <td style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#9CA3AF">{tailscale_disp}</td>
+            <td style="color:#9CA3AF;font-size:12px">{time_str}</td>
         </tr>"""
+        
     total = len(rows)
+    
     html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>SafeLock Telemetry</title>
-<meta http-equiv="refresh" content="60">
+<html><head><meta charset="utf-8"><title>OpenLock Telemetry</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body{{background:#070c14;color:#e2e8f0;font-family:Arial,sans-serif;padding:32px;}}
-  h1{{color:#00d4ff;font-size:24px;margin-bottom:4px}}
-  .sub{{color:#475569;font-size:13px;margin-bottom:32px}}
-  .stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}}
-  .stat{{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:20px}}
-  .stat .val{{font-size:36px;font-weight:700;font-family:monospace}}
-  .stat .lbl{{font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:.1em;margin-top:4px}}
-  table{{width:100%;border-collapse:collapse;background:rgba(255,255,255,0.02);border-radius:12px;overflow:hidden}}
-  th{{background:rgba(0,0,0,0.3);padding:12px 16px;text-align:left;font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:.1em}}
-  td{{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.04)}}
-</style></head><body>
-<h1>🔒 SafeLock Telemetry</h1>
-<div class="sub">OpenLock Security — Panel interno · Se actualiza cada 60 segundos</div>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;600;700&display=swap');
+  body {{ background: #050608; color: #D1D5DB; font-family: 'IBM Plex Sans', sans-serif; padding: 32px; margin: 0; }}
+  h1 {{ color: #29B5B5; font-size: 24px; margin-bottom: 4px; font-family: 'IBM Plex Mono', monospace; font-weight: 600; letter-spacing: .05em; }}
+  .sub {{ color: #9CA3AF; font-size: 13px; margin-bottom: 24px; }}
+  
+  .search-container {{ margin-bottom: 24px; }}
+  .search-box {{ width: 100%; max-width: 400px; padding: 12px 16px; background: #121417; border: 1px solid #444444; border-radius: 6px; color: #FFFFFF; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; outline: none; transition: border-color 0.2s; }}
+  .search-box:focus {{ border-color: #29B5B5; }}
+
+  .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 32px; }}
+  .stat {{ background: #121417; border: 1px solid #444444; border-radius: 6px; padding: 20px; border-left: 4px solid #444444; }}
+  .stat.brand {{ border-left-color: #0F5F5F; }}
+  .stat.ok {{ border-left-color: #10B981; }}
+  .stat.err {{ border-left-color: #EF4444; }}
+  .stat.prem {{ border-left-color: #29B5B5; }}
+  .stat .val {{ font-size: 32px; font-weight: 400; font-family: 'IBM Plex Mono', monospace; color: #FFFFFF; }}
+  .stat .lbl {{ font-size: 10px; color: #9CA3AF; text-transform: uppercase; letter-spacing: .1em; margin-top: 8px; font-family: 'IBM Plex Mono', monospace; }}
+  
+  table {{ width: 100%; border-collapse: collapse; background: #121417; border-radius: 6px; overflow: hidden; border: 1px solid #444444; }}
+  th {{ background: #08090A; padding: 14px 16px; text-align: left; font-size: 10px; color: #9CA3AF; text-transform: uppercase; letter-spacing: .1em; font-family: 'IBM Plex Mono', monospace; border-bottom: 1px solid #444444; }}
+  td {{ padding: 14px 16px; border-bottom: 1px solid #252A30; font-size: 13px; }}
+  tr:hover {{ background: rgba(255,255,255,0.02); }}
+  
+  .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; font-family: 'IBM Plex Mono', monospace; letter-spacing: .1em; }}
+  .bg-green {{ background: rgba(16, 185, 129, 0.15); color: #10B981; border: 1px solid rgba(16, 185, 129, 0.3); }}
+  .bg-red {{ background: rgba(239, 68, 68, 0.15); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3); }}
+</style>
+<script>
+  // Filtro de búsqueda en tiempo real
+  function filterTable() {{
+    let input = document.getElementById("searchBox");
+    let filter = input.value.toUpperCase();
+    let table = document.getElementById("deviceTable");
+    let tr = table.getElementsByTagName("tr");
+    
+    for (let i = 1; i < tr.length; i++) {{
+      let tdID = tr[i].getElementsByTagName("td")[0];
+      let tdIP = tr[i].getElementsByTagName("td")[3];
+      if (tdID || tdIP) {{
+        let txtValueID = tdID.textContent || tdID.innerText;
+        let txtValueIP = tdIP.textContent || tdIP.innerText;
+        if (txtValueID.toUpperCase().indexOf(filter) > -1 || txtValueIP.toUpperCase().indexOf(filter) > -1) {{
+          tr[i].style.display = "";
+        }} else {{
+          tr[i].style.display = "none";
+        }}
+      }}
+    }}
+  }}
+  // Refrescar página cada 60s si no se está escribiendo
+  setTimeout(() => {{ if(!document.getElementById('searchBox').value) window.location.reload(); }}, 60000);
+</script>
+</head><body>
+<h1>🔒 OpenLock Telemetry SOC</h1>
+<div class="sub">Panel de Control Interno · Actualización en tiempo real</div>
+
 <div class="stats">
-  <div class="stat"><div class="val" style="color:#00d4ff">{total}</div><div class="lbl">Total unidades</div></div>
-  <div class="stat"><div class="val" style="color:#22c55e">{online}</div><div class="lbl">Online</div></div>
-  <div class="stat"><div class="val" style="color:#ef4444">{offline}</div><div class="lbl">Offline</div></div>
-  <div class="stat"><div class="val" style="color:#a855f7">{pihole_on}</div><div class="lbl">Pi-hole activo</div></div>
+  <div class="stat brand"><div class="val">{total}</div><div class="lbl">Total unidades</div></div>
+  <div class="stat ok"><div class="val">{online}</div><div class="lbl">SafeLocks Online</div></div>
+  <div class="stat err"><div class="val">{offline}</div><div class="lbl">SafeLocks Offline</div></div>
+  <div class="stat prem"><div class="val">{pihole_on}</div><div class="lbl">Suscripciones Premium</div></div>
 </div>
-<table>
-  <tr><th>Device ID</th><th>Estado</th><th>Pi-hole</th><th>Tailscale IP</th><th>Último reporte</th></tr>
-  {rows_html if rows_html else '<tr><td colspan="5" style="text-align:center;color:#475569;padding:32px">Sin dispositivos registrados</td></tr>'}
+
+<div class="search-container">
+  <input type="text" id="searchBox" class="search-box" onkeyup="filterTable()" placeholder="Buscar por ID de dispositivo o IP de Tailscale...">
+</div>
+
+<table id="deviceTable">
+  <tr><th>Device ID</th><th>Estado Red</th><th>Plan Pi-hole</th><th>Tailscale IP (Acceso)</th><th>Último Reporte</th></tr>
+  {rows_html if rows_html else '<tr><td colspan="5" style="text-align:center;color:#9CA3AF;padding:40px">Sin dispositivos reportando a la flota</td></tr>'}
 </table>
 </body></html>"""
     return HTMLResponse(html)
 
 @app.get("/")
 def root():
-    return {"service": "SafeLock Telemetry", "version": "1.0.0"}
+    return {"service": "SafeLock Telemetry", "status": "active", "version": "1.1.0"}
