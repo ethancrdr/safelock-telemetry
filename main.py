@@ -35,13 +35,13 @@ def verificar_acceso_dashboard(credentials: HTTPBasicCredentials = Depends(secur
         )
     return credentials.username
 
-# --- MODELO ACTUALIZADO: Bandera de Alerta Crítica ---
+# --- MODELO ---
 class Heartbeat(BaseModel):
     device_id: str
     pihole_active: bool
     tailscale_ip: str = ""
     version: str = "1.0"
-    critical_alert: bool = False  # <-- Solo será True si hay un fallo/ataque serio
+    critical_alert: bool = False
 
 @app.post("/heartbeat")
 async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
@@ -53,7 +53,7 @@ async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
         "pihole_active": data.pihole_active,
         "tailscale_ip": data.tailscale_ip,
         "version": data.version,
-        "critical_alert": data.critical_alert, # Guardamos el estado de emergencia
+        "critical_alert": data.critical_alert,
         "last_seen": datetime.now(timezone.utc).isoformat(),
         "status": "online"
     }
@@ -140,18 +140,17 @@ async def dashboard_ui():
         .stat .val { font-size: 32px; font-weight: 400; font-family: 'IBM Plex Mono', monospace; color: #FFFFFF; }
         .stat .lbl { font-size: 10px; color: #9CA3AF; text-transform: uppercase; letter-spacing: .1em; margin-top: 8px; font-family: 'IBM Plex Mono', monospace; }
 
+        /* Estilos del buscador */
+        .search-container { margin-bottom: 24px; }
+        .search-box { width: 100%; max-width: 400px; padding: 12px 16px; background: #121417; border: 1px solid #444444; border-radius: 6px; color: #FFFFFF; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; outline: none; transition: border-color 0.2s; }
+        .search-box:focus { border-color: #29B5B5; }
+
         table { width: 100%; border-collapse: collapse; background: #121417; border-radius: 6px; overflow: hidden; border: 1px solid #444444; }
         th { background: #08090A; padding: 14px 16px; text-align: left; font-size: 10px; color: #9CA3AF; text-transform: uppercase; letter-spacing: .1em; font-family: 'IBM Plex Mono', monospace; border-bottom: 1px solid #444444; }
         td { padding: 14px 16px; border-bottom: 1px solid #252A30; font-size: 13px; }
         
-        /* Animación para el parpadeo de alerta roja */
-        @keyframes pulse-red {
-            0% { background-color: rgba(239, 68, 68, 0.05); }
-            50% { background-color: rgba(239, 68, 68, 0.2); }
-            100% { background-color: rgba(239, 68, 68, 0.05); }
-        }
-
-        .row-critical { animation: pulse-red 2s infinite; border-left: 3px solid #EF4444; }
+        /* Estilos de Triage estáticos (sin parpadeo) */
+        .row-critical { background: rgba(239, 68, 68, 0.05); border-left: 3px solid #EF4444; }
         .row-offline { opacity: 0.6; }
         .row-ok:hover { background: rgba(255,255,255,0.02); }
 
@@ -187,6 +186,10 @@ async def dashboard_ui():
             <div class="stat" style="border-left-color: #10B981"><div class="val" id="st-online">0</div><div class="lbl">Online (OK)</div></div>
             <div class="stat" style="border-left-color: #EF4444"><div class="val" id="st-alerts">0</div><div class="lbl">Emergencias Activas</div></div>
             <div class="stat" style="border-left-color: #29B5B5"><div class="val" id="st-premium">0</div><div class="lbl">Premium Activos</div></div>
+        </div>
+
+        <div class="search-container">
+            <input type="text" id="searchBox" class="search-box" onkeyup="filterTable()" placeholder="Buscar por ID de dispositivo o IP de Tailscale...">
         </div>
 
         <table>
@@ -251,6 +254,8 @@ async def dashboard_ui():
                     processData(data);
                     const now = new Date().toLocaleTimeString('es-ES', { hour12: false });
                     btn.innerText = "Actualizar (Última vez: " + now + ")";
+                    // Volver a aplicar filtro si el usuario tenía algo escrito al actualizar
+                    filterTable(); 
                 })
                 .catch(err => console.error(err));
         }
@@ -284,7 +289,7 @@ async def dashboard_ui():
                     rowClass = "row-offline";
                     statusBadge = `<span class="badge" style="background:#374151;color:#D1D5DB">OFFLINE</span>`;
                 } else if (d.critical_alert) {
-                    rowClass = "row-critical"; // Animación de parpadeo rojo
+                    rowClass = "row-critical"; // Estático, sin parpadeo
                     statusBadge = `<span class="badge bg-red">🚨 ALERTA ROJA</span>`;
                 }
 
@@ -310,6 +315,31 @@ async def dashboard_ui():
             document.getElementById('st-premium').innerText = tPrem;
         }
 
+        // Función de Búsqueda
+        function filterTable() {
+            let input = document.getElementById("searchBox");
+            if (!input) return;
+            let filter = input.value.toUpperCase();
+            let tableBody = document.getElementById("tableBody");
+            let tr = tableBody.getElementsByTagName("tr");
+            
+            for (let i = 0; i < tr.length; i++) {
+                let tdID = tr[i].getElementsByTagName("td")[0];
+                let tdIP = tr[i].getElementsByTagName("td")[3];
+                
+                if (tdID && tdIP) {
+                    let txtValueID = tdID.textContent || tdID.innerText;
+                    let txtValueIP = tdIP.textContent || tdIP.innerText;
+                    
+                    if (txtValueID.toUpperCase().indexOf(filter) > -1 || txtValueIP.toUpperCase().indexOf(filter) > -1) {
+                        tr[i].style.display = "";
+                    } else {
+                        tr[i].style.display = "none";
+                    }
+                }
+            }
+        }
+
         if (localStorage.getItem('soc_auth')) {
             showDashboard();
             fetchData();
@@ -321,4 +351,4 @@ async def dashboard_ui():
 
 @app.get("/")
 def root():
-    return {"service": "SafeLock Telemetry", "status": "active", "version": "1.3.0"}
+    return {"service": "SafeLock Telemetry", "status": "active", "version": "1.3.1"}
