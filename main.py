@@ -420,7 +420,7 @@ async def dashboard_ui():
                     <td>${piholeBadge}</td>
                     <td style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#9CA3AF">${escapeHtml(d.tailscale_ip || 'Sin configurar')}</td>
                     <td style="color:#9CA3AF;font-size:12px">${escapeHtml(d.time_ago)}</td>
-                    <td><button class="btn-meta" type="button" onclick="openMetadataModal('${escapeAttribute(d.device_id)}')">Editar</button></td>
+                    <td><button class="btn-meta" type="button" data-device-id="${escapeHtml(d.device_id)}" onclick="openMetadataModal(this.dataset.deviceId)">Editar</button></td>
                 </tr>`;
             });
 
@@ -511,11 +511,6 @@ async def dashboard_ui():
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#39;');
         }
-
-        function escapeAttribute(value) {
-            return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        }
-
         if (localStorage.getItem('soc_auth')) {
             showDashboard();
             fetchData();
