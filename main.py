@@ -4,6 +4,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 import os
+import json
 import httpx
 import secrets
 
@@ -12,8 +13,26 @@ app = FastAPI(title="SafeLock Telemetry SOC")
 API_SECRET = os.environ.get("API_SECRET", "openlock2026")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+METADATA_FILE = os.path.join(os.path.dirname(__file__), "device_metadata.json")
 
 security = HTTPBasic()
+
+
+def load_device_metadata():
+    if not os.path.exists(METADATA_FILE):
+        return {}
+
+    try:
+        with open(METADATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_device_metadata(metadata):
+    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 def sb_headers():
     return {
@@ -42,6 +61,11 @@ class Heartbeat(BaseModel):
     tailscale_ip: str = ""
     version: str = "1.0"
     critical_alert: bool = False
+
+
+class DeviceMetadataUpdate(BaseModel):
+    display_name: str = ""
+    label: str = ""
 
 @app.post("/heartbeat")
 async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
@@ -80,6 +104,7 @@ async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
     rows = r.json()
     now = datetime.now(timezone.utc)
     valid_rows = []
+    metadata = load_device_metadata()
     
     for d in rows:
         last_seen_str = d.get("last_seen")
@@ -97,13 +122,32 @@ async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
             ago = now - last
             mins = int(ago.total_seconds() / 60)
             d["time_ago"] = f"hace {mins}m" if mins < 60 else f"hace {mins//60}h"
-            d["critical_alert"] = d.get("critical_alert", False) 
+            d["critical_alert"] = d.get("critical_alert", False)
+            device_meta = metadata.get(d["device_id"], {})
+            d["display_name"] = device_meta.get("display_name", "")
+            d["label"] = device_meta.get("label", "")
             
             valid_rows.append(d)
         except ValueError:
             continue
             
     return {"devices": valid_rows}
+
+
+@app.post("/api/device-metadata/{device_id}")
+async def update_device_metadata(
+    device_id: str,
+    data: DeviceMetadataUpdate,
+    username: str = Depends(verificar_acceso_dashboard),
+):
+    metadata = load_device_metadata()
+    metadata[device_id] = {
+        "display_name": data.display_name.strip(),
+        "label": data.label.strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_device_metadata(metadata)
+    return {"ok": True, "device_id": device_id, "metadata": metadata[device_id]}
 
 # --- EL FRONTEND HTML/JS ---
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -144,6 +188,23 @@ async def dashboard_ui():
         .search-container { margin-bottom: 24px; }
         .search-box { width: 100%; max-width: 400px; padding: 12px 16px; background: #121417; border: 1px solid #444444; border-radius: 6px; color: #FFFFFF; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; outline: none; transition: border-color 0.2s; }
         .search-box:focus { border-color: #29B5B5; }
+        .meta-name { color: #FFFFFF; font-weight: 600; }
+        .meta-label { display: inline-block; padding: 4px 8px; border-radius: 999px; background: rgba(41,181,181,0.12); color: #7CE7E7; border: 1px solid rgba(41,181,181,0.25); font-size: 11px; }
+        .meta-empty { color: #6B7280; font-size: 12px; }
+        .btn-meta { background: transparent; border: 1px solid #3A4048; color: #D1D5DB; padding: 8px 10px; border-radius: 6px; cursor: pointer; font-family: 'IBM Plex Mono', monospace; font-size: 11px; text-transform: uppercase; }
+        .btn-meta:hover { border-color: #29B5B5; color: #29B5B5; }
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(5, 6, 8, 0.78); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 20; }
+        .modal-backdrop.open { display: flex; }
+        .modal-card { width: 100%; max-width: 460px; background: #121417; border: 1px solid #333; border-radius: 12px; padding: 24px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45); }
+        .modal-card h3 { margin: 0 0 8px; color: #FFFFFF; font-size: 18px; }
+        .modal-card p { margin: 0 0 20px; color: #9CA3AF; font-size: 13px; }
+        .modal-card label { display: block; margin-bottom: 8px; color: #D1D5DB; font-size: 12px; }
+        .modal-card input { width: 100%; padding: 12px; margin-bottom: 16px; background: #08090A; border: 1px solid #333; color: #fff; border-radius: 6px; outline: none; font-family: 'IBM Plex Sans', sans-serif; }
+        .modal-card input:focus { border-color: #29B5B5; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 12px; }
+        .btn-secondary { background: transparent; color: #D1D5DB; border: 1px solid #3A4048; padding: 10px 14px; border-radius: 6px; cursor: pointer; }
+        .btn-primary { background: #29B5B5; color: #000; border: none; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-weight: 700; }
+        .modal-error { color: #EF4444; font-size: 12px; min-height: 18px; margin-bottom: 12px; }
 
         table { width: 100%; border-collapse: collapse; background: #121417; border-radius: 6px; overflow: hidden; border: 1px solid #444444; }
         th { background: #08090A; padding: 14px 16px; text-align: left; font-size: 10px; color: #9CA3AF; text-transform: uppercase; letter-spacing: .1em; font-family: 'IBM Plex Mono', monospace; border-bottom: 1px solid #444444; }
@@ -157,6 +218,13 @@ async def dashboard_ui():
         .badge { padding: 4px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; font-family: 'IBM Plex Mono', monospace; letter-spacing: .1em; }
         .bg-green { background: rgba(16, 185, 129, 0.15); color: #10B981; border: 1px solid rgba(16, 185, 129, 0.3); }
         .bg-red { background: rgba(239, 68, 68, 0.15); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+        @media (max-width: 900px) {
+            .stats { grid-template-columns: repeat(2, 1fr); }
+            #dashboard-view { padding: 20px; }
+            .header { flex-direction: column; align-items: flex-start; gap: 16px; }
+            table { display: block; overflow-x: auto; }
+        }
     </style>
 </head>
 <body>
@@ -189,17 +257,20 @@ async def dashboard_ui():
         </div>
 
         <div class="search-container">
-            <input type="text" id="searchBox" class="search-box" onkeyup="filterTable()" placeholder="Buscar por ID de dispositivo o IP de Tailscale...">
+            <input type="text" id="searchBox" class="search-box" onkeyup="filterTable()" placeholder="Buscar por ID, nombre, etiqueta o IP de Tailscale...">
         </div>
 
         <table>
             <thead>
                 <tr>
                     <th>Device ID</th>
+                    <th>Nombre</th>
+                    <th>Etiqueta</th>
                     <th>Estado y Salud</th>
                     <th>Plan Pi-hole</th>
                     <th>Tailscale IP</th>
                     <th>Último Reporte</th>
+                    <th>Acciones</th>
                 </tr>
             </thead>
             <tbody id="tableBody">
@@ -207,7 +278,26 @@ async def dashboard_ui():
         </table>
     </div>
 
+    <div id="metadataModal" class="modal-backdrop">
+        <div class="modal-card">
+            <h3>Asignar nombre y etiqueta</h3>
+            <p id="modalDeviceId"></p>
+            <label for="deviceNameInput">Nombre del dispositivo</label>
+            <input type="text" id="deviceNameInput" maxlength="80" placeholder="Ej. Recepción principal">
+            <label for="deviceLabelInput">Etiqueta</label>
+            <input type="text" id="deviceLabelInput" maxlength="60" placeholder="Ej. Puerta 1">
+            <div id="metadataError" class="modal-error"></div>
+            <div class="modal-actions">
+                <button class="btn-secondary" type="button" onclick="closeMetadataModal()">Cancelar</button>
+                <button class="btn-primary" type="button" id="saveMetadataBtn" onclick="saveMetadata()">Guardar</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        let fleetDevices = [];
+        let activeDeviceId = null;
+
         function handleLogin(e) {
             e.preventDefault();
             const u = document.getElementById('user').value;
@@ -221,8 +311,11 @@ async def dashboard_ui():
                     if (res.ok) {
                         localStorage.setItem('soc_auth', token);
                         showDashboard();
-                        processData(res);
+                        return res.json();
                     } else throw new Error('Unauthorized');
+                })
+                .then(data => {
+                    if (data) processData(data);
                 })
                 .catch(err => {
                     document.getElementById('loginBtn').innerText = "Ingresar";
@@ -262,6 +355,7 @@ async def dashboard_ui():
 
         function processData(data) {
             let devices = data.devices || [];
+            fleetDevices = devices;
             
             // ORDENAMIENTO DE SALUD: 1° Alerta Roja, 2° Offline, 3° Online OK
             devices.sort((a, b) => {
@@ -275,13 +369,24 @@ async def dashboard_ui():
             });
 
             let tOnline = 0, tAlerts = 0, tPrem = 0;
-            let html = "";
 
             devices.forEach(d => {
                 if (d.status === 'online') tOnline++;
                 if (d.critical_alert) tAlerts++;
                 if (d.pihole_active && d.status === 'online') tPrem++;
+            });
+            
+            document.getElementById('st-total').innerText = devices.length;
+            document.getElementById('st-online').innerText = tOnline;
+            document.getElementById('st-alerts').innerText = tAlerts;
+            document.getElementById('st-premium').innerText = tPrem;
+            filterTable();
+        }
 
+        function renderTable(devices) {
+            let html = "";
+
+            devices.forEach(d => {
                 let rowClass = "row-ok";
                 let statusBadge = `<span class="badge bg-green">SISTEMA OK</span>`;
                 
@@ -289,55 +394,117 @@ async def dashboard_ui():
                     rowClass = "row-offline";
                     statusBadge = `<span class="badge" style="background:#374151;color:#D1D5DB">OFFLINE</span>`;
                 } else if (d.critical_alert) {
-                    rowClass = "row-critical"; // Estático, sin parpadeo
+                    rowClass = "row-critical";
                     statusBadge = `<span class="badge bg-red">🚨 ALERTA ROJA</span>`;
                 }
 
-                let piholeBadge = d.pihole_active 
-                    ? `<span class="badge bg-green">PREMIUM</span>` 
+                let piholeBadge = d.pihole_active
+                    ? `<span class="badge bg-green">PREMIUM</span>`
                     : `<span class="badge bg-red">SUSPENDIDO</span>`;
 
                 html += `
                 <tr class="${rowClass}">
-                    <td style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#FFFFFF;font-weight:600;">${d.device_id}</td>
+                    <td style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#FFFFFF;font-weight:600;">${escapeHtml(d.device_id)}</td>
+                    <td>${d.display_name ? `<span class="meta-name">${escapeHtml(d.display_name)}</span>` : '<span class="meta-empty">Sin nombre</span>'}</td>
+                    <td>${d.label ? `<span class="meta-label">${escapeHtml(d.label)}</span>` : '<span class="meta-empty">Sin etiqueta</span>'}</td>
                     <td>${statusBadge}</td>
                     <td>${piholeBadge}</td>
-                    <td style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#9CA3AF">${d.tailscale_ip || 'Sin configurar'}</td>
-                    <td style="color:#9CA3AF;font-size:12px">${d.time_ago}</td>
+                    <td style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#9CA3AF">${escapeHtml(d.tailscale_ip || 'Sin configurar')}</td>
+                    <td style="color:#9CA3AF;font-size:12px">${escapeHtml(d.time_ago)}</td>
+                    <td><button class="btn-meta" type="button" onclick="openMetadataModal('${escapeAttribute(d.device_id)}')">Editar</button></td>
                 </tr>`;
             });
 
-            document.getElementById('tableBody').innerHTML = html || '<tr><td colspan="5" style="text-align:center;color:#9CA3AF;padding:40px">Sin dispositivos en flota</td></tr>';
-            
-            document.getElementById('st-total').innerText = devices.length;
-            document.getElementById('st-online').innerText = tOnline;
-            document.getElementById('st-alerts').innerText = tAlerts;
-            document.getElementById('st-premium').innerText = tPrem;
+            document.getElementById('tableBody').innerHTML = html || '<tr><td colspan="8" style="text-align:center;color:#9CA3AF;padding:40px">Sin dispositivos en flota</td></tr>';
         }
 
-        // Función de Búsqueda
         function filterTable() {
-            let input = document.getElementById("searchBox");
+            const input = document.getElementById("searchBox");
             if (!input) return;
-            let filter = input.value.toUpperCase();
-            let tableBody = document.getElementById("tableBody");
-            let tr = tableBody.getElementsByTagName("tr");
-            
-            for (let i = 0; i < tr.length; i++) {
-                let tdID = tr[i].getElementsByTagName("td")[0];
-                let tdIP = tr[i].getElementsByTagName("td")[3];
-                
-                if (tdID && tdIP) {
-                    let txtValueID = tdID.textContent || tdID.innerText;
-                    let txtValueIP = tdIP.textContent || tdIP.innerText;
-                    
-                    if (txtValueID.toUpperCase().indexOf(filter) > -1 || txtValueIP.toUpperCase().indexOf(filter) > -1) {
-                        tr[i].style.display = "";
-                    } else {
-                        tr[i].style.display = "none";
+            const filter = input.value.trim().toUpperCase();
+
+            const filtered = fleetDevices.filter(device => {
+                const haystack = [
+                    device.device_id || "",
+                    device.tailscale_ip || "",
+                    device.display_name || "",
+                    device.label || ""
+                ].join(" ").toUpperCase();
+                return haystack.indexOf(filter) > -1;
+            });
+
+            renderTable(filtered);
+        }
+
+        function openMetadataModal(deviceId) {
+            const device = fleetDevices.find(d => d.device_id === deviceId);
+            activeDeviceId = deviceId;
+            document.getElementById('modalDeviceId').innerText = deviceId;
+            document.getElementById('deviceNameInput').value = device && device.display_name ? device.display_name : '';
+            document.getElementById('deviceLabelInput').value = device && device.label ? device.label : '';
+            document.getElementById('metadataError').innerText = '';
+            document.getElementById('metadataModal').classList.add('open');
+        }
+
+        function closeMetadataModal() {
+            activeDeviceId = null;
+            document.getElementById('metadataModal').classList.remove('open');
+        }
+
+        function saveMetadata() {
+            const token = localStorage.getItem('soc_auth');
+            if (!token || !activeDeviceId) return;
+
+            const displayName = document.getElementById('deviceNameInput').value.trim();
+            const label = document.getElementById('deviceLabelInput').value.trim();
+            const saveBtn = document.getElementById('saveMetadataBtn');
+            const errorBox = document.getElementById('metadataError');
+
+            saveBtn.innerText = 'Guardando...';
+            saveBtn.disabled = true;
+            errorBox.innerText = '';
+
+            fetch('/api/device-metadata/' + encodeURIComponent(activeDeviceId), {
+                method: 'POST',
+                headers: {
+                    'Authorization': 'Basic ' + token,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ display_name: displayName, label: label })
+            })
+                .then(res => {
+                    if (!res.ok) throw new Error('No se pudo guardar');
+                    return res.json();
+                })
+                .then(() => {
+                    const device = fleetDevices.find(d => d.device_id === activeDeviceId);
+                    if (device) {
+                        device.display_name = displayName;
+                        device.label = label;
                     }
-                }
-            }
+                    closeMetadataModal();
+                    filterTable();
+                })
+                .catch(() => {
+                    errorBox.innerText = 'No se pudo guardar la información del dispositivo.';
+                })
+                .finally(() => {
+                    saveBtn.innerText = 'Guardar';
+                    saveBtn.disabled = false;
+                });
+        }
+
+        function escapeHtml(value) {
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function escapeAttribute(value) {
+            return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         }
 
         if (localStorage.getItem('soc_auth')) {
