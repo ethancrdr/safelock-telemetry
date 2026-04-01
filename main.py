@@ -134,6 +134,11 @@ async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
     return {"devices": valid_rows}
 
 
+@app.get("/api/auth-check")
+async def auth_check(username: str = Depends(verificar_acceso_dashboard)):
+    return {"ok": True, "user": username}
+
+
 @app.post("/api/device-metadata/{device_id}")
 async def update_device_metadata(
     device_id: str,
@@ -306,20 +311,24 @@ async def dashboard_ui():
             
             document.getElementById('loginBtn').innerText = "Validando...";
             
-            fetch('/api/fleet', { headers: { 'Authorization': 'Basic ' + token } })
+            fetch('/api/auth-check', { headers: { 'Authorization': 'Basic ' + token } })
                 .then(res => {
                     if (res.ok) {
                         localStorage.setItem('soc_auth', token);
                         showDashboard();
-                        return res.json();
-                    } else throw new Error('Unauthorized');
-                })
-                .then(data => {
-                    if (data) processData(data);
+                        fetchData();
+                        return null;
+                    }
+                    if (res.status === 401) throw new Error('Unauthorized');
+                    throw new Error('ServerError');
                 })
                 .catch(err => {
                     document.getElementById('loginBtn').innerText = "Ingresar";
-                    document.getElementById('loginError').style.display = 'block';
+                    const errorEl = document.getElementById('loginError');
+                    errorEl.style.display = 'block';
+                    errorEl.innerText = err.message === 'Unauthorized'
+                        ? 'Credenciales incorrectas'
+                        : 'No se pudo validar el acceso. Revisa el servidor.';
                 });
         }
 
