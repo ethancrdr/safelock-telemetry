@@ -13,26 +13,8 @@ app = FastAPI(title="SafeLock Telemetry SOC")
 API_SECRET = os.environ.get("API_SECRET", "openlock2026")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-METADATA_FILE = os.path.join(os.path.dirname(__file__), "device_metadata.json")
 
 security = HTTPBasic()
-
-
-def load_device_metadata():
-    if not os.path.exists(METADATA_FILE):
-        return {}
-
-    try:
-        with open(METADATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_device_metadata(metadata):
-    with open(METADATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 def sb_headers():
     return {
@@ -54,7 +36,7 @@ def verificar_acceso_dashboard(credentials: HTTPBasicCredentials = Depends(secur
         )
     return credentials.username
 
-# --- MODELO ---
+# --- MODELOS ---
 class Heartbeat(BaseModel):
     device_id: str
     pihole_active: bool
@@ -62,11 +44,11 @@ class Heartbeat(BaseModel):
     version: str = "1.0"
     critical_alert: bool = False
 
-
 class DeviceMetadataUpdate(BaseModel):
     display_name: str = ""
     label: str = ""
 
+# --- HEARTBEAT ---
 @app.post("/heartbeat")
 async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
     if x_api_secret != API_SECRET:
@@ -90,11 +72,12 @@ async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
         )
     return {"ok": r.status_code in [200, 201, 204]}
 
+# --- FLEET ---
 @app.get("/api/fleet")
 async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
     async with httpx.AsyncClient() as client:
         r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version,critical_alert&limit=500",
+            f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version,critical_alert,display_name,label&limit=500",
             headers=sb_headers()
         )
         
@@ -104,7 +87,6 @@ async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
     rows = r.json()
     now = datetime.now(timezone.utc)
     valid_rows = []
-    metadata = load_device_metadata()
     
     for d in rows:
         last_seen_str = d.get("last_seen")
@@ -123,9 +105,8 @@ async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
             mins = int(ago.total_seconds() / 60)
             d["time_ago"] = f"hace {mins}m" if mins < 60 else f"hace {mins//60}h"
             d["critical_alert"] = d.get("critical_alert", False)
-            device_meta = metadata.get(d["device_id"], {})
-            d["display_name"] = device_meta.get("display_name", "")
-            d["label"] = device_meta.get("label", "")
+            d["display_name"] = d.get("display_name", "")
+            d["label"] = d.get("label", "")
             
             valid_rows.append(d)
         except ValueError:
@@ -133,28 +114,38 @@ async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
             
     return {"devices": valid_rows}
 
-
+# --- AUTH CHECK ---
 @app.get("/api/auth-check")
 async def auth_check(username: str = Depends(verificar_acceso_dashboard)):
     return {"ok": True, "user": username}
 
-
+# --- UPDATE METADATA (Supabase) ---
 @app.post("/api/device-metadata/{device_id}")
 async def update_device_metadata(
     device_id: str,
     data: DeviceMetadataUpdate,
     username: str = Depends(verificar_acceso_dashboard),
 ):
-    metadata = load_device_metadata()
-    metadata[device_id] = {
+    payload = {
+        "device_id": device_id,
         "display_name": data.display_name.strip(),
         "label": data.label.strip(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    save_device_metadata(metadata)
-    return {"ok": True, "device_id": device_id, "metadata": metadata[device_id]}
+    
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
+            headers=sb_headers(),
+            json=payload
+        )
+    
+    if r.status_code not in [200, 201, 204]:
+        raise HTTPException(status_code=500, detail=f"Error guardando en Supabase: {r.text}")
+    
+    return {"ok": True, "device_id": device_id, "metadata": payload}
 
-# --- EL FRONTEND HTML/JS ---
+# --- DASHBOARD HTML/JS ---
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_ui():
     html_content = """<!DOCTYPE html>
@@ -356,7 +347,6 @@ async def dashboard_ui():
                     processData(data);
                     const now = new Date().toLocaleTimeString('es-ES', { hour12: false });
                     btn.innerText = "Actualizar (Última vez: " + now + ")";
-                    // Volver a aplicar filtro si el usuario tenía algo escrito al actualizar
                     filterTable(); 
                 })
                 .catch(err => console.error(err));
