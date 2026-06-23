@@ -1,13 +1,22 @@
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 import os
 import httpx
 import secrets
 
-app = FastAPI(title="SafeLock Telemetry SOC")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=20.0)
+    yield
+    await app.state.http.aclose()
+
+
+app = FastAPI(title="SafeLock Telemetry SOC", lifespan=lifespan)
 
 API_SECRET = os.environ.get("API_SECRET", "openlock2026")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -66,7 +75,7 @@ class DeviceMetadataUpdate(BaseModel):
 
 # --- HEARTBEAT ---
 @app.post("/heartbeat")
-async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
+async def heartbeat(request: Request, data: Heartbeat, x_api_secret: str = Header(None)):
     require_supabase()
 
     if x_api_secret != API_SECRET:
@@ -82,12 +91,12 @@ async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
         "status": "online"
     }
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(
-            f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
-            headers=sb_headers(),
-            json=payload
-        )
+    client = request.app.state.http
+    r = await client.post(
+        f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
+        headers=sb_headers(),
+        json=payload
+    )
 
     if r.status_code not in [200, 201, 204]:
         raise HTTPException(status_code=500, detail=f"Error guardando heartbeat en Supabase: {r.text}")
@@ -97,14 +106,14 @@ async def heartbeat(data: Heartbeat, x_api_secret: str = Header(None)):
 
 # --- FLEET ---
 @app.get("/api/fleet")
-async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
+async def get_fleet_data(request: Request, username: str = Depends(verificar_acceso_dashboard)):
     require_supabase()
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version,critical_alert,display_name,label&limit=500",
-            headers=sb_headers()
-        )
+    client = request.app.state.http
+    r = await client.get(
+        f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version,critical_alert,display_name,label&limit=500",
+        headers=sb_headers()
+    )
 
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=f"Error de Supabase: {r.text}")
@@ -150,6 +159,7 @@ async def auth_check(username: str = Depends(verificar_acceso_dashboard)):
 # --- UPDATE METADATA (Supabase) ---
 @app.post("/api/device-metadata/{device_id}")
 async def update_device_metadata(
+    request: Request,
     device_id: str,
     data: DeviceMetadataUpdate,
     username: str = Depends(verificar_acceso_dashboard),
@@ -163,12 +173,12 @@ async def update_device_metadata(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(
-            f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
-            headers=sb_headers(),
-            json=payload
-        )
+    client = request.app.state.http
+    r = await client.post(
+        f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
+        headers=sb_headers(),
+        json=payload
+    )
 
     if r.status_code not in [200, 201, 204]:
         raise HTTPException(
