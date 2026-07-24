@@ -7,6 +7,9 @@ from contextlib import asynccontextmanager
 import os
 import httpx
 import secrets
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @asynccontextmanager
