@@ -347,8 +347,8 @@ async def dashboard_ui():
         function handleLogin(e) {
             e.preventDefault();
 
-            const u = document.getElementById('user').value;
-            const p = document.getElementById('pass').value;
+            const u = document.getElementById('user').value.trim();
+            const p = document.getElementById('pass').value.trim();
             const token = btoa(u + ':' + p);
 
             document.getElementById('loginBtn').innerText = "Validando...";
@@ -589,8 +589,17 @@ async def dashboard_ui():
         }
 
         if (localStorage.getItem('soc_auth')) {
-            showDashboard();
-            fetchData();
+            const token = localStorage.getItem('soc_auth');
+            fetch('/api/auth-check', { headers: { 'Authorization': 'Basic ' + token } })
+                .then(res => {
+                    if (res.ok) {
+                        showDashboard();
+                        fetchData();
+                    } else {
+                        localStorage.removeItem('soc_auth');
+                    }
+                })
+                .catch(() => localStorage.removeItem('soc_auth'));
         }
     </script>
 </body>
