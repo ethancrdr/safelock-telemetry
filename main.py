@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -600,4 +600,9 @@ async def dashboard_ui():
 
 @app.get("/")
 def root():
+    return RedirectResponse(url="/dashboard")
+
+
+@app.get("/status")
+def status():
     return {"service": "SafeLock Telemetry", "status": "active", "version": "1.3.2"}
