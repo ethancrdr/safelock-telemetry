@@ -4,6 +4,8 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
+import hashlib
 import os
 import httpx
 import secrets
@@ -25,7 +27,61 @@ API_SECRET = os.environ.get("API_SECRET", "openlock2026")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
+# --- Configuración OTA ---
+# Token que usa GitHub Actions para registrar un release nuevo.
+OTA_ADMIN_TOKEN = os.environ.get("OTA_ADMIN_TOKEN", "")
+
+# Secreto de arranque: solo sirve para que un dispositivo se enrole una vez y
+# reciba su secreto propio. Se cierra (ENROLLMENT_OPEN=false) al terminar la
+# migración de la flota.
+ENROLLMENT_SECRET = os.environ.get("ENROLLMENT_SECRET", API_SECRET)
+ENROLLMENT_OPEN = os.environ.get("ENROLLMENT_OPEN", "true").lower() == "true"
+
+# Mientras haya equipos sin migrar siguen llegando heartbeats con el secreto
+# compartido antiguo. Se apaga cuando el dashboard muestre 100% migrado.
+LEGACY_SECRET_ENABLED = os.environ.get("LEGACY_SECRET_ENABLED", "true").lower() == "true"
+
+# Contraseña del dashboard, separada del secreto de los dispositivos para poder
+# rotar una sin tocar la otra.
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", API_SECRET)
+
+# Credenciales SMTP que los dispositivos descargan en /etc/safelock/env.
+DEVICE_SMTP = {
+    "SMTP_SERVER": os.environ.get("SMTP_SERVER", ""),
+    "SMTP_PORT": os.environ.get("SMTP_PORT", "587"),
+    "SMTP_SENDER": os.environ.get("SMTP_SENDER", ""),
+    "SMTP_PASSWORD": os.environ.get("SMTP_PASSWORD", ""),
+}
+
 security = HTTPBasic()
+
+
+def hash_secret(valor: str) -> str:
+    return hashlib.sha256(valor.encode("utf-8")).hexdigest()
+
+
+# --- Acceso a Supabase ---
+def sb_client() -> httpx.AsyncClient:
+    """Cliente compartido creado en el lifespan. Abrir uno por petición hacía
+    crecer la memoria del proceso sin límite (commit 35c5c0f)."""
+    return app.state.http
+
+
+async def sb_get(path: str):
+    return await sb_client().get(f"{SUPABASE_URL}/rest/v1/{path}", headers=sb_headers())
+
+
+async def sb_post(path: str, payload):
+    return await sb_client().post(f"{SUPABASE_URL}/rest/v1/{path}",
+                                  headers=sb_headers(), json=payload)
+
+
+async def sb_rows(path: str) -> List[Dict[str, Any]]:
+    r = await sb_get(path)
+    if r.status_code != 200:
+        return []
+    data = r.json()
+    return data if isinstance(data, list) else []
 
 
 def sb_headers():
@@ -50,7 +106,7 @@ def require_supabase():
 # --- Seguridad ---
 def verificar_acceso_dashboard(credentials: HTTPBasicCredentials = Depends(security)):
     usuario_correcto = secrets.compare_digest(credentials.username, "admin")
-    clave_correcta = secrets.compare_digest(credentials.password, API_SECRET)
+    clave_correcta = secrets.compare_digest(credentials.password, DASHBOARD_PASSWORD)
 
     if not (usuario_correcto and clave_correcta):
         raise HTTPException(
@@ -65,10 +121,16 @@ def verificar_acceso_dashboard(credentials: HTTPBasicCredentials = Depends(secur
 # --- MODELOS ---
 class Heartbeat(BaseModel):
     device_id: str
-    pihole_active: bool
+    pihole_active: bool = False
     tailscale_ip: str = ""
     version: str = "1.0"
+    commit: str = ""
     critical_alert: bool = False
+    # Enviados por el agente OTA nuevo; ausentes en los equipos sin migrar.
+    ota: Optional[Dict[str, Any]] = None
+    health: Optional[Dict[str, Any]] = None
+    # Enviado por el heartbeat.sh antiguo durante la migración.
+    migration_state: str = ""
 
 
 class DeviceMetadataUpdate(BaseModel):
@@ -76,47 +138,244 @@ class DeviceMetadataUpdate(BaseModel):
     label: str = ""
 
 
-# --- HEARTBEAT ---
-@app.post("/heartbeat")
-async def heartbeat(request: Request, data: Heartbeat, x_api_secret: str = Header(None)):
+class EnrollRequest(BaseModel):
+    device_id: str
+    secret: str
+
+
+class ReleaseRequest(BaseModel):
+    tag: str
+    notes: str = ""
+
+
+class PromoteRequest(BaseModel):
+    tag: str
+    channel: str = "stable"
+
+
+class PauseRequest(BaseModel):
+    paused: bool = True
+    channel: str = "stable"
+
+
+# --- Autenticación de dispositivos ---
+async def autenticar_dispositivo(
+    x_device_id: Optional[str] = Header(None),
+    x_device_secret: Optional[str] = Header(None),
+    x_api_secret: Optional[str] = Header(None),
+) -> str:
+    """Secreto propio del dispositivo; el compartido antiguo solo mientras dure
+    la migración."""
     require_supabase()
 
-    if x_api_secret != API_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if x_device_id and x_device_secret:
+        filas = await sb_rows(f"devices?device_id=eq.{x_device_id}&select=secret_hash")
+        guardado = (filas[0].get("secret_hash") if filas else None) or ""
+        if guardado and secrets.compare_digest(guardado, hash_secret(x_device_secret)):
+            return x_device_id
 
+    if LEGACY_SECRET_ENABLED and x_api_secret and secrets.compare_digest(x_api_secret, API_SECRET):
+        return x_device_id or ""
+
+    raise HTTPException(status_code=401, detail="Dispositivo no autorizado")
+
+
+def verificar_admin(x_admin_token: Optional[str] = Header(None)) -> bool:
+    if not OTA_ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="OTA_ADMIN_TOKEN no está configurado")
+    if not (x_admin_token and secrets.compare_digest(x_admin_token, OTA_ADMIN_TOKEN)):
+        raise HTTPException(status_code=401, detail="Token de administración inválido")
+    return True
+
+
+# --- HEARTBEAT ---
+@app.post("/heartbeat")
+async def heartbeat(
+    data: Heartbeat,
+    autenticado: str = Depends(autenticar_dispositivo),
+):
+    # Un dispositivo autenticado con su secreto propio solo puede reportar
+    # sobre sí mismo.
+    if autenticado and autenticado != data.device_id:
+        raise HTTPException(status_code=403, detail="device_id no coincide con la credencial")
+
+    ota = data.ota or {}
     payload = {
         "device_id": data.device_id,
         "pihole_active": data.pihole_active,
         "tailscale_ip": data.tailscale_ip,
         "version": data.version,
+        "commit_sha": data.commit,
         "critical_alert": data.critical_alert,
+        "ota_state": ota.get("state", ""),
+        "ota_error": (ota.get("last_error") or "")[:500],
+        "ota": ota,
+        "health": data.health or {},
         "last_seen": datetime.now(timezone.utc).isoformat(),
-        "status": "online"
+        "status": "online",
     }
+    if data.migration_state:
+        payload["migration_state"] = data.migration_state
 
-    client = request.app.state.http
-    r = await client.post(
-        f"{SUPABASE_URL}/rest/v1/devices?on_conflict=device_id",
-        headers=sb_headers(),
-        json=payload
-    )
-
+    r = await sb_post("devices?on_conflict=device_id", payload)
     if r.status_code not in [200, 201, 204]:
         raise HTTPException(status_code=500, detail=f"Error guardando heartbeat en Supabase: {r.text}")
 
     return {"ok": True}
 
 
-# --- FLEET ---
-@app.get("/api/fleet")
-async def get_fleet_data(request: Request, username: str = Depends(verificar_acceso_dashboard)):
+# --- ENROLAMIENTO ---
+@app.post("/api/enroll")
+async def enroll(data: EnrollRequest, x_api_secret: Optional[str] = Header(None)):
+    """Un dispositivo cambia el secreto compartido por uno propio, una sola vez."""
     require_supabase()
 
-    client = request.app.state.http
-    r = await client.get(
-        f"{SUPABASE_URL}/rest/v1/devices?select=device_id,pihole_active,tailscale_ip,last_seen,version,critical_alert,display_name,label&limit=500",
-        headers=sb_headers()
-    )
+    if not ENROLLMENT_OPEN:
+        raise HTTPException(status_code=403, detail="El enrolamiento está cerrado")
+
+    if not (x_api_secret and secrets.compare_digest(x_api_secret, ENROLLMENT_SECRET)):
+        raise HTTPException(status_code=401, detail="Secreto de enrolamiento inválido")
+
+    filas = await sb_rows(f"devices?device_id=eq.{data.device_id}&select=secret_hash")
+    if filas and filas[0].get("secret_hash"):
+        # Ya tiene secreto: reenrolar permitiría suplantarlo desde fuera.
+        raise HTTPException(status_code=409, detail="El dispositivo ya está enrolado")
+
+    r = await sb_post("devices?on_conflict=device_id", {
+        "device_id": data.device_id,
+        "secret_hash": hash_secret(data.secret),
+        "enrolled_at": datetime.now(timezone.utc).isoformat(),
+    })
+    if r.status_code not in [200, 201, 204]:
+        raise HTTPException(status_code=500, detail=f"Error enrolando: {r.text}")
+
+    return {"ok": True, "device_id": data.device_id}
+
+
+# --- OBJETIVO OTA ---
+@app.get("/api/ota/target")
+async def ota_target(device_id: str = Depends(autenticar_dispositivo)):
+    """Qué versión le toca a este dispositivo según su canal."""
+    canal = "stable"
+    if device_id:
+        filas = await sb_rows(f"devices?device_id=eq.{device_id}&select=channel")
+        if filas and filas[0].get("channel"):
+            canal = filas[0]["channel"]
+
+    objetivos = await sb_rows(f"ota_targets?channel=eq.{canal}&select=tag,paused")
+    if not objetivos:
+        return {"tag": None, "paused": False, "channel": canal}
+
+    return {
+        "tag": objetivos[0].get("tag"),
+        "paused": bool(objetivos[0].get("paused")),
+        "channel": canal,
+    }
+
+
+# --- CONFIGURACIÓN QUE BAJA EL DISPOSITIVO ---
+@app.get("/api/device-config")
+async def device_config(device_id: str = Depends(autenticar_dispositivo)):
+    return {"smtp": DEVICE_SMTP}
+
+
+# --- REGISTRO Y PROMOCIÓN DE RELEASES ---
+@app.post("/api/ota/releases")
+async def registrar_release(data: ReleaseRequest, _: bool = Depends(verificar_admin)):
+    """Lo llama GitHub Actions al publicar un tag. Entra siempre por canary."""
+    require_supabase()
+    ahora = datetime.now(timezone.utc).isoformat()
+
+    r = await sb_post("ota_releases?on_conflict=tag", {
+        "tag": data.tag,
+        "created_at": ahora,
+        "status": "canary",
+        "notes": data.notes,
+    })
+    if r.status_code not in [200, 201, 204]:
+        raise HTTPException(status_code=500, detail=f"Error registrando release: {r.text}")
+
+    await sb_post("ota_targets?on_conflict=channel", {
+        "channel": "canary",
+        "tag": data.tag,
+        "paused": False,
+        "updated_at": ahora,
+    })
+    return {"ok": True, "tag": data.tag, "channel": "canary"}
+
+
+@app.post("/api/ota/promote")
+async def promover_release(
+    data: PromoteRequest,
+    username: str = Depends(verificar_acceso_dashboard),
+):
+    """Promueve un tag al canal indicado (por defecto stable = toda la flota)."""
+    require_supabase()
+    ahora = datetime.now(timezone.utc).isoformat()
+
+    releases = await sb_rows(f"ota_releases?tag=eq.{data.tag}&select=tag")
+    if not releases:
+        raise HTTPException(status_code=404, detail=f"El release {data.tag} no está registrado")
+
+    r = await sb_post("ota_targets?on_conflict=channel", {
+        "channel": data.channel,
+        "tag": data.tag,
+        "paused": False,
+        "updated_at": ahora,
+    })
+    if r.status_code not in [200, 201, 204]:
+        raise HTTPException(status_code=500, detail=f"Error promoviendo: {r.text}")
+
+    if data.channel == "stable":
+        await sb_post("ota_releases?on_conflict=tag",
+                      {"tag": data.tag, "status": "stable"})
+
+    return {"ok": True, "tag": data.tag, "channel": data.channel}
+
+
+@app.post("/api/ota/pause")
+async def pausar_rollout(
+    data: PauseRequest,
+    username: str = Depends(verificar_acceso_dashboard),
+):
+    """Congela el rollout sin revertir nada: los equipos se quedan donde están."""
+    require_supabase()
+    objetivos = await sb_rows(f"ota_targets?channel=eq.{data.channel}&select=tag")
+    tag = objetivos[0].get("tag") if objetivos else None
+
+    r = await sb_post("ota_targets?on_conflict=channel", {
+        "channel": data.channel,
+        "tag": tag,
+        "paused": data.paused,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    if r.status_code not in [200, 201, 204]:
+        raise HTTPException(status_code=500, detail=f"Error pausando: {r.text}")
+
+    return {"ok": True, "channel": data.channel, "paused": data.paused}
+
+
+@app.get("/api/ota/status")
+async def estado_rollout(username: str = Depends(verificar_acceso_dashboard)):
+    """Resumen del rollout para el dashboard."""
+    require_supabase()
+    objetivos = await sb_rows("ota_targets?select=channel,tag,paused,updated_at")
+    releases = await sb_rows("ota_releases?select=tag,status,created_at&order=created_at.desc&limit=10")
+    return {
+        "targets": {o["channel"]: o for o in objetivos if o.get("channel")},
+        "releases": releases,
+    }
+
+
+# --- FLEET ---
+@app.get("/api/fleet")
+async def get_fleet_data(username: str = Depends(verificar_acceso_dashboard)):
+    require_supabase()
+
+    campos = ("device_id,pihole_active,tailscale_ip,last_seen,version,critical_alert,"
+              "display_name,label,commit_sha,channel,ota_state,ota,health,migration_state")
+
+    r = await sb_get(f"devices?select={campos}&limit=500")
 
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail=f"Error de Supabase: {r.text}")
@@ -124,6 +383,10 @@ async def get_fleet_data(request: Request, username: str = Depends(verificar_acc
     rows = r.json()
     now = datetime.now(timezone.utc)
     valid_rows = []
+
+    # Versión objetivo, para poder marcar quién está al día y quién no.
+    objetivos = await sb_rows("ota_targets?select=channel,tag,paused")
+    targets = {o["channel"]: o for o in objetivos if o.get("channel")}
 
     for d in rows:
         last_seen_str = d.get("last_seen")
@@ -145,12 +408,20 @@ async def get_fleet_data(request: Request, username: str = Depends(verificar_acc
             d["display_name"] = d.get("display_name", "")
             d["label"] = d.get("label", "")
 
+            canal = d.get("channel") or "stable"
+            objetivo = (targets.get(canal) or {}).get("tag")
+            d["channel"] = canal
+            d["target_version"] = objetivo
+            d["up_to_date"] = bool(objetivo) and d.get("version") == objetivo
+            d["ota_state"] = d.get("ota_state") or ""
+            d["migrated"] = bool(d.get("ota"))
+
             valid_rows.append(d)
 
         except ValueError:
             continue
 
-    return {"devices": valid_rows}
+    return {"devices": valid_rows, "targets": targets}
 
 
 # --- AUTH CHECK ---
@@ -250,6 +521,22 @@ async def dashboard_ui():
         .btn-primary { background: #29B5B5; color: #000; border: none; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-weight: 700; }
         .modal-error { color: #EF4444; font-size: 12px; min-height: 18px; margin-bottom: 12px; white-space: pre-wrap; }
 
+        /* Panel de rollout OTA */
+        .rollout { background: #121417; border: 1px solid #444444; border-radius: 6px; padding: 20px; margin-bottom: 24px; }
+        .rollout-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+        .rollout-head h2 { margin: 0; font-size: 14px; color: #29B5B5; font-family: 'IBM Plex Mono', monospace; text-transform: uppercase; letter-spacing: .1em; }
+        .rollout-actions { display: flex; gap: 10px; }
+        .rollout-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+        .rollout-item { background: #08090A; border: 1px solid #252A30; border-radius: 6px; padding: 12px 14px; }
+        .rollout-item .k { font-size: 10px; color: #9CA3AF; text-transform: uppercase; letter-spacing: .1em; font-family: 'IBM Plex Mono', monospace; }
+        .rollout-item .v { font-size: 18px; color: #FFFFFF; font-family: 'IBM Plex Mono', monospace; margin-top: 6px; }
+        .bar { height: 6px; background: #252A30; border-radius: 999px; overflow: hidden; margin-top: 10px; }
+        .bar > i { display: block; height: 100%; background: #10B981; }
+        .ver-ok { color: #10B981; }
+        .ver-old { color: #F59E0B; }
+        .ver-bad { color: #EF4444; }
+        .paused-tag { background: rgba(245,158,11,.15); color: #F59E0B; border: 1px solid rgba(245,158,11,.35); padding: 4px 8px; border-radius: 4px; font-size: 10px; font-family: 'IBM Plex Mono', monospace; text-transform: uppercase; }
+
         table { width: 100%; border-collapse: collapse; background: #121417; border-radius: 6px; overflow: hidden; border: 1px solid #444444; }
         th { background: #08090A; padding: 14px 16px; text-align: left; font-size: 10px; color: #9CA3AF; text-transform: uppercase; letter-spacing: .1em; font-family: 'IBM Plex Mono', monospace; border-bottom: 1px solid #444444; }
         td { padding: 14px 16px; border-bottom: 1px solid #252A30; font-size: 13px; }
@@ -299,6 +586,18 @@ async def dashboard_ui():
             <div class="stat" style="border-left-color: #29B5B5"><div class="val" id="st-premium">0</div><div class="lbl">Premium Activos</div></div>
         </div>
 
+        <div class="rollout">
+            <div class="rollout-head">
+                <h2>Rollout OTA</h2>
+                <div class="rollout-actions">
+                    <button class="btn-refresh" type="button" id="promoteBtn" onclick="promoteCanary()">Promover canary a toda la flota</button>
+                    <button class="btn-refresh" type="button" id="pauseBtn" onclick="togglePause()">Pausar rollout</button>
+                </div>
+            </div>
+            <div class="rollout-grid" id="rolloutGrid"></div>
+            <div id="rolloutMsg" style="margin-top:12px;font-size:12px;color:#9CA3AF"></div>
+        </div>
+
         <div class="search-container">
             <input type="text" id="searchBox" class="search-box" onkeyup="filterTable()" placeholder="Buscar por ID, nombre, etiqueta o IP de Tailscale...">
         </div>
@@ -309,6 +608,7 @@ async def dashboard_ui():
                     <th>Device ID</th>
                     <th>Nombre</th>
                     <th>Etiqueta</th>
+                    <th>Versión</th>
                     <th>Estado y Salud</th>
                     <th>Plan Pi-hole</th>
                     <th>Tailscale IP</th>
@@ -343,6 +643,7 @@ async def dashboard_ui():
     <script>
         let fleetDevices = [];
         let activeDeviceId = null;
+        let fleetTargets = {};
 
         function handleLogin(e) {
             e.preventDefault();
@@ -421,6 +722,8 @@ async def dashboard_ui():
         function processData(data) {
             let devices = data.devices || [];
             fleetDevices = devices;
+            fleetTargets = data.targets || {};
+            renderRollout(devices);
 
             devices.sort((a, b) => {
                 if (a.critical_alert && !b.critical_alert) return -1;
@@ -467,11 +770,27 @@ async def dashboard_ui():
                     ? `<span class="badge bg-green">PREMIUM</span>`
                     : `<span class="badge bg-red">SUSPENDIDO</span>`;
 
+                let verClass = d.up_to_date ? 'ver-ok' : 'ver-old';
+                let verNota = '';
+                const otaState = d.ota_state || '';
+                if (otaState === 'failed' || (d.ota && d.ota.last_result === 'rollback')) {
+                    verClass = 'ver-bad';
+                    verNota = '<div style="font-size:10px;color:#EF4444">rollback</div>';
+                } else if (otaState === 'rescue') {
+                    verClass = 'ver-bad';
+                    verNota = '<div style="font-size:10px;color:#EF4444">rescate</div>';
+                } else if (otaState === 'updating') {
+                    verNota = '<div style="font-size:10px;color:#9CA3AF">actualizando…</div>';
+                } else if (!d.migrated) {
+                    verNota = '<div style="font-size:10px;color:#F59E0B">sin migrar</div>';
+                }
+
                 html += `
                 <tr class="${rowClass}">
                     <td style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#FFFFFF;font-weight:600;">${escapeHtml(d.device_id)}</td>
                     <td>${d.display_name ? `<span class="meta-name">${escapeHtml(d.display_name)}</span>` : '<span class="meta-empty">Sin nombre</span>'}</td>
                     <td>${d.label ? `<span class="meta-label">${escapeHtml(d.label)}</span>` : '<span class="meta-empty">Sin etiqueta</span>'}</td>
+                    <td style="font-family:'IBM Plex Mono',monospace;font-size:12px"><span class="${verClass}">${escapeHtml(d.version || '—')}</span>${verNota}</td>
                     <td>${statusBadge}</td>
                     <td>${piholeBadge}</td>
                     <td style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#9CA3AF">${escapeHtml(d.tailscale_ip || 'Sin configurar')}</td>
@@ -481,7 +800,95 @@ async def dashboard_ui():
             });
 
             document.getElementById('tableBody').innerHTML =
-                html || '<tr><td colspan="8" style="text-align:center;color:#9CA3AF;padding:40px">Sin dispositivos en flota</td></tr>';
+                html || '<tr><td colspan="9" style="text-align:center;color:#9CA3AF;padding:40px">Sin dispositivos en flota</td></tr>';
+        }
+
+        function renderRollout(devices) {
+            const stable = fleetTargets.stable || {};
+            const canary = fleetTargets.canary || {};
+            const objetivo = stable.tag || null;
+
+            const alDia = devices.filter(d => objetivo && d.version === objetivo).length;
+            const migrados = devices.filter(d => d.migrated).length;
+            const problemas = devices.filter(d =>
+                d.ota_state === 'failed' || d.ota_state === 'rescue' ||
+                (d.ota && d.ota.last_result === 'rollback')).length;
+            const pct = devices.length ? Math.round(alDia * 100 / devices.length) : 0;
+
+            const versiones = {};
+            devices.forEach(d => {
+                const v = d.version || 'desconocida';
+                versiones[v] = (versiones[v] || 0) + 1;
+            });
+            const desglose = Object.keys(versiones).sort()
+                .map(v => `${escapeHtml(v)}: ${versiones[v]}`).join(' · ') || '—';
+
+            document.getElementById('rolloutGrid').innerHTML = `
+                <div class="rollout-item">
+                    <div class="k">Versión objetivo (stable)</div>
+                    <div class="v">${escapeHtml(objetivo || 'sin definir')}</div>
+                    ${stable.paused ? '<div style="margin-top:8px"><span class="paused-tag">rollout en pausa</span></div>' : ''}
+                </div>
+                <div class="rollout-item">
+                    <div class="k">En canary</div>
+                    <div class="v">${escapeHtml(canary.tag || '—')}</div>
+                </div>
+                <div class="rollout-item">
+                    <div class="k">Flota al día</div>
+                    <div class="v">${alDia} / ${devices.length}</div>
+                    <div class="bar"><i style="width:${pct}%"></i></div>
+                </div>
+                <div class="rollout-item">
+                    <div class="k">Migrados a OTA v2</div>
+                    <div class="v">${migrados} / ${devices.length}</div>
+                </div>
+                <div class="rollout-item">
+                    <div class="k">Con problemas</div>
+                    <div class="v" style="color:${problemas ? '#EF4444' : '#FFFFFF'}">${problemas}</div>
+                </div>`;
+
+            document.getElementById('pauseBtn').innerText =
+                stable.paused ? 'Reanudar rollout' : 'Pausar rollout';
+            document.getElementById('rolloutMsg').innerText = 'Versiones en flota — ' + desglose;
+        }
+
+        function otaPost(ruta, cuerpo, exito) {
+            const token = localStorage.getItem('soc_auth');
+            if (!token) return;
+
+            const msg = document.getElementById('rolloutMsg');
+            msg.innerText = 'Aplicando…';
+
+            fetch(ruta, {
+                method: 'POST',
+                headers: { 'Authorization': 'Basic ' + token, 'Content-Type': 'application/json' },
+                body: JSON.stringify(cuerpo)
+            })
+                .then(async res => {
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.detail || 'Falló la operación');
+                    msg.innerText = exito;
+                    fetchData();
+                })
+                .catch(err => { msg.innerText = 'Error: ' + err.message; });
+        }
+
+        function promoteCanary() {
+            const canary = fleetTargets.canary || {};
+            if (!canary.tag) {
+                document.getElementById('rolloutMsg').innerText = 'No hay ningún release en canary.';
+                return;
+            }
+            if (!confirm('Promover ' + canary.tag + ' a toda la flota?')) return;
+            otaPost('/api/ota/promote', { tag: canary.tag, channel: 'stable' },
+                    canary.tag + ' promovido a stable.');
+        }
+
+        function togglePause() {
+            const stable = fleetTargets.stable || {};
+            const pausar = !stable.paused;
+            otaPost('/api/ota/pause', { paused: pausar, channel: 'stable' },
+                    pausar ? 'Rollout pausado.' : 'Rollout reanudado.');
         }
 
         function filterTable() {
@@ -614,4 +1021,4 @@ def root():
 
 @app.get("/status")
 def status():
-    return {"service": "SafeLock Telemetry", "status": "active", "version": "1.3.2"}
+    return {"service": "SafeLock Telemetry", "status": "active", "version": "2.0.0"}
