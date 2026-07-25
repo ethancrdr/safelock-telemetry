@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 import hashlib
 import os
+import re
 import httpx
 import secrets
 from dotenv import load_dotenv
@@ -44,6 +45,15 @@ LEGACY_SECRET_ENABLED = os.environ.get("LEGACY_SECRET_ENABLED", "true").lower() 
 # Contraseña del dashboard, separada del secreto de los dispositivos para poder
 # rotar una sin tocar la otra.
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", API_SECRET)
+
+# El repositorio es privado, asi que los equipos no pueden descargar los assets
+# de GitHub Releases. El CI los sube aqui al publicar un tag y este servidor se
+# los sirve a cada dispositivo autenticado. Sigue siendo solo transporte: la
+# firma RSA se verifica en el equipo, asi que un servidor comprometido no puede
+# instalar codigo que no venga firmado con la clave OTA.
+ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", "/var/lib/safelock/releases")
+MAX_ARTIFACT_BYTES = 300 * 1024 * 1024
+NOMBRE_SEGURO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Credenciales SMTP que los dispositivos descargan en /etc/safelock/env.
 DEVICE_SMTP = {
@@ -271,6 +281,62 @@ async def ota_target(device_id: str = Depends(autenticar_dispositivo)):
         "paused": bool(objetivos[0].get("paused")),
         "channel": canal,
     }
+
+
+# --- ARTEFACTOS DE RELEASE ---
+def ruta_artefacto(tag: str, nombre: str) -> str:
+    """Ruta en disco de un asset, rechazando cualquier intento de salir de
+    ARTIFACT_DIR (tag y nombre llegan de la URL)."""
+    if not (NOMBRE_SEGURO.match(tag) and NOMBRE_SEGURO.match(nombre)):
+        raise HTTPException(status_code=400, detail="Nombre de artefacto inválido")
+
+    base = os.path.abspath(ARTIFACT_DIR)
+    destino = os.path.abspath(os.path.join(base, tag, nombre))
+    if not destino.startswith(base + os.sep):
+        raise HTTPException(status_code=400, detail="Ruta de artefacto inválida")
+    return destino
+
+
+@app.put("/api/ota/artifact/{tag}/{nombre}")
+async def subir_artefacto(
+    tag: str,
+    nombre: str,
+    request: Request,
+    _: bool = Depends(verificar_admin),
+):
+    """La sube GitHub Actions al publicar. Se escribe a .tmp y se renombra para
+    que un corte a mitad no deje un artefacto truncado servible."""
+    destino = ruta_artefacto(tag, nombre)
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    tmp = destino + ".tmp"
+
+    total = 0
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > MAX_ARTIFACT_BYTES:
+                    raise HTTPException(status_code=413, detail="Artefacto demasiado grande")
+                f.write(chunk)
+        os.replace(tmp, destino)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+    return {"ok": True, "tag": tag, "name": nombre, "size": total}
+
+
+@app.get("/api/ota/artifact/{tag}/{nombre}")
+async def descargar_artefacto(
+    tag: str,
+    nombre: str,
+    device_id: str = Depends(autenticar_dispositivo),
+):
+    ruta = ruta_artefacto(tag, nombre)
+    if not os.path.isfile(ruta):
+        raise HTTPException(status_code=404, detail=f"No existe {nombre} para {tag}")
+    return FileResponse(ruta, media_type="application/octet-stream", filename=nombre)
 
 
 # --- CONFIGURACIÓN QUE BAJA EL DISPOSITIVO ---
