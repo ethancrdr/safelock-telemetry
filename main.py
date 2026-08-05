@@ -213,7 +213,6 @@ async def heartbeat(
     payload = {
         "device_id": data.device_id,
         "pihole_active": data.pihole_active,
-        "tailscale_ip": data.tailscale_ip,
         "version": data.version,
         "commit_sha": data.commit,
         "critical_alert": data.critical_alert,
@@ -224,6 +223,10 @@ async def heartbeat(
         "last_seen": datetime.now(timezone.utc).isoformat(),
         "status": "online",
     }
+    # Si el agente no logra leer su IP en este ciclo (tailscaled aún no
+    # arriba, blip de red) manda "". No pisar la última IP buena conocida.
+    if data.tailscale_ip:
+        payload["tailscale_ip"] = data.tailscale_ip
     if data.migration_state:
         payload["migration_state"] = data.migration_state
 
